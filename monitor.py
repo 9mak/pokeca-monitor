@@ -13,10 +13,10 @@ HEADERS = {
 }
 
 PAGES = [
-    {"name": "ヨドバシ",     "post_id": 78763, "slug": "yodobashi"},
-    {"name": "ビックカメラ", "post_id": 78776, "slug": "biccamera"},
-    {"name": "ポケセン",     "post_id": 78787, "slug": "pokesen"},
-    {"name": "量販店",       "post_id": 50167, "slug": "stores"},
+    {"name": "ヨドバシ",     "post_id": 78763, "slug": "yodobashi", "color": "#E60012", "header_text_color": "#FFFFFF"},
+    {"name": "ビックカメラ", "post_id": 78776, "slug": "biccamera", "color": "#E50012", "header_text_color": "#FFFFFF"},
+    {"name": "ポケセン",     "post_id": 78787, "slug": "pokesen",   "color": "#FFCB05", "header_text_color": "#1B1B1B"},
+    {"name": "量販店",       "post_id": 50167, "slug": "stores",    "color": "#3B82F6", "header_text_color": "#FFFFFF"},
 ]
 
 WP_BASE = "https://gamenv.net/tc/wp-json/wp/v2"
@@ -65,22 +65,60 @@ def extract_images(html: str) -> list[str]:
 
 def format_time(date_str: str) -> str:
     dt = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc).astimezone(JST)
-    return dt.strftime("%H:%M")
+    return dt.strftime("%-m/%-d %H:%M")
 
 
 TEXT_LIMIT = 1000
 
 
-def build_comment_text(page: dict, comment: dict) -> str:
+def build_flex_bubble(page: dict, comment: dict) -> dict:
     html = comment["content"]["rendered"]
     body = strip_html(html)
     if len(body) > TEXT_LIMIT:
         body = body[:TEXT_LIMIT] + "…"
     time_str = format_time(comment["date"])
     is_reply = comment.get("parent", 0) > 0
-    header = f"↩ {page['name']}掲示板（返信） {time_str}" if is_reply else f"💬 {page['name']}掲示板 {time_str}"
+    header_label = f"↩ {page['name']}掲示板（返信）" if is_reply else f"💬 {page['name']}掲示板"
     link = comment.get("link") or f"{PAGE_BASE}/{page['slug']}/#comment-{comment['id']}"
-    return f"{header}\n\n{body}\n\n🔗 {link}"
+
+    header_text_color = page["header_text_color"]
+    sub_color = "#1B1B1BAA" if header_text_color == "#1B1B1B" else "#FFFFFFCC"
+
+    return {
+        "type": "bubble",
+        "size": "kilo",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": page["color"],
+            "paddingAll": "12px",
+            "contents": [
+                {"type": "text", "text": header_label, "color": header_text_color, "weight": "bold", "size": "md"},
+                {"type": "text", "text": time_str, "color": sub_color, "size": "xs", "margin": "xs"},
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "16px",
+            "contents": [
+                {"type": "text", "text": body or "（本文なし）", "wrap": True, "size": "md", "color": "#1B1B1B"},
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "12px",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": page["color"],
+                    "action": {"type": "uri", "label": "サイトで見る", "uri": link},
+                }
+            ],
+        },
+    }
 
 
 def send_line_messages(token: str, user_id: str, messages: list[dict]) -> None:
@@ -97,11 +135,18 @@ def send_line_messages(token: str, user_id: str, messages: list[dict]) -> None:
 
 
 def notify_comment(token: str, user_id: str, page: dict, comment: dict) -> None:
-    """1コメント = 1通知（テキスト + 画像最大4枚を1リクエストにまとめる）"""
-    text = build_comment_text(page, comment)
-    images = extract_images(comment["content"]["rendered"])
+    """1コメント = 1通知（Flex Message + 画像最大4枚を1リクエストにまとめる）"""
+    bubble = build_flex_bubble(page, comment)
+    is_reply = comment.get("parent", 0) > 0
+    alt_prefix = "↩" if is_reply else "💬"
+    alt_text = f"{alt_prefix} {page['name']}掲示板に新着コメント"
 
-    messages: list[dict] = [{"type": "text", "text": text}]
+    messages: list[dict] = [{
+        "type": "flex",
+        "altText": alt_text,
+        "contents": bubble,
+    }]
+    images = extract_images(comment["content"]["rendered"])
     for img_url in images[:4]:  # LINEは1リクエスト最大5メッセージ
         messages.append({
             "type": "image",
