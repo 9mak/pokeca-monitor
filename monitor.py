@@ -68,72 +68,47 @@ def format_time(date_str: str) -> str:
     return dt.strftime("%H:%M")
 
 
-def build_message(page: dict, new_comments: list[dict], all_comments: list[dict]) -> tuple[str, list[str]]:
-    """テキストメッセージと画像URLリストを返す"""
-    comment_map = {c["id"]: c for c in all_comments}
-    count = len(new_comments)
-    page_url = f"{PAGE_BASE}/{page['slug']}/"
-    lines = [f"【{page['name']}掲示板】{count}件の新着\n"]
-
-    images: list[str] = []
-
-    for c in sorted(new_comments, key=lambda x: x["id"]):
-        html = c["content"]["rendered"]
-        text = strip_html(html)[:100]
-        time_str = format_time(c["date"])
-        parent_id = c.get("parent", 0)
-        comment_url = f"{page_url}#comment-{c['id']}"
-
-        if parent_id and parent_id in comment_map:
-            parent_text = strip_html(comment_map[parent_id]["content"]["rendered"])[:30]
-            lines.append(f"  ↩ 匿名 {time_str}（返信）")
-            lines.append(f"  ← {parent_text}...")
-            lines.append(f"  {text}")
-            lines.append(f"  🔗 {comment_url}")
-        else:
-            lines.append(f"💬 匿名 {time_str}")
-            lines.append(text)
-            lines.append(f"🔗 {comment_url}")
-
-        imgs = extract_images(html)
-        images.extend(imgs)
-        lines.append("")
-
-    return "\n".join(lines).strip(), images
+TEXT_LIMIT = 1000
 
 
-def send_line_text(token: str, user_id: str, text: str) -> None:
+def build_comment_text(page: dict, comment: dict) -> str:
+    html = comment["content"]["rendered"]
+    body = strip_html(html)
+    if len(body) > TEXT_LIMIT:
+        body = body[:TEXT_LIMIT] + "…"
+    time_str = format_time(comment["date"])
+    is_reply = comment.get("parent", 0) > 0
+    header = f"↩ {page['name']}掲示板（返信） {time_str}" if is_reply else f"💬 {page['name']}掲示板 {time_str}"
+    link = comment.get("link") or f"{PAGE_BASE}/{page['slug']}/#comment-{comment['id']}"
+    return f"{header}\n\n{body}\n\n🔗 {link}"
+
+
+def send_line_messages(token: str, user_id: str, messages: list[dict]) -> None:
+    """1〜5件のmessageオブジェクトをまとめて1リクエストで送る"""
     requests.post(
         LINE_API,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
-        json={
-            "to": user_id,
-            "messages": [{"type": "text", "text": text}],
-        },
+        json={"to": user_id, "messages": messages},
         timeout=10,
     ).raise_for_status()
 
 
-def send_line_image(token: str, user_id: str, image_url: str) -> None:
-    requests.post(
-        LINE_API,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "to": user_id,
-            "messages": [{
-                "type": "image",
-                "originalContentUrl": image_url,
-                "previewImageUrl": image_url,
-            }],
-        },
-        timeout=10,
-    ).raise_for_status()
+def notify_comment(token: str, user_id: str, page: dict, comment: dict) -> None:
+    """1コメント = 1通知（テキスト + 画像最大4枚を1リクエストにまとめる）"""
+    text = build_comment_text(page, comment)
+    images = extract_images(comment["content"]["rendered"])
+
+    messages: list[dict] = [{"type": "text", "text": text}]
+    for img_url in images[:4]:  # LINEは1リクエスト最大5メッセージ
+        messages.append({
+            "type": "image",
+            "originalContentUrl": img_url,
+            "previewImageUrl": img_url,
+        })
+    send_line_messages(token, user_id, messages)
 
 
 def main() -> None:
@@ -161,19 +136,19 @@ def main() -> None:
         if not new_comments:
             continue
 
-        try:
-            text_msg, images = build_message(page, new_comments, all_comments)
-            send_line_text(line_token, line_user_id, text_msg)
-            for img_url in images[:3]:  # 最大3枚
-                send_line_image(line_token, line_user_id, img_url)
-        except Exception as e:
-            print(f"[{page['name']}] LINE send error: {e}", file=sys.stderr)
-            continue
+        notified = 0
+        for c in sorted(new_comments, key=lambda x: x["id"]):
+            try:
+                notify_comment(line_token, line_user_id, page, c)
+                notified += 1
+                last_ids[str(post_id)] = c["id"]
+                state_updated = True
+            except Exception as e:
+                print(f"[{page['name']}] LINE send error (comment {c['id']}): {e}", file=sys.stderr)
+                break  # 失敗したらこのページは中断（次回再試行できるよう状態保存）
 
-        max_id = max(c["id"] for c in new_comments)
-        last_ids[str(post_id)] = max_id
-        state_updated = True
-        print(f"[{page['name']}] {len(new_comments)}件通知 (max_id={max_id})")
+        if notified:
+            print(f"[{page['name']}] {notified}件通知 (max_id={last_ids[str(post_id)]})")
 
     if state_updated:
         state["last_comment_ids"] = last_ids
