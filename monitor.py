@@ -1,15 +1,16 @@
 import json
 import os
-import re
 import sys
 from datetime import datetime, timezone, timedelta
+from html.parser import HTMLParser
 
 import requests
 
 JST = timezone(timedelta(hours=9))
 
+# bot識別情報を含めつつ、サイト側で弾かれないUA
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (compatible; pokeca-monitor/1.0; +https://github.com/9mak/pokeca-monitor)"
 }
 
 PAGES = [
@@ -24,6 +25,24 @@ PAGE_BASE = "https://gamenv.net/tc"
 
 LINE_API = "https://api.line.me/v2/bot/message/push"
 
+TEXT_LIMIT = 1000
+
+
+def safe_error_str(e: Exception) -> str:
+    """例外を安全な文字列に変換する。
+
+    requests.HTTPErrorのstr(e)はリクエストヘッダ（Authorization: Bearer ...）を
+    含む可能性があるため、HTTPステータスコードのみを抽出する。
+    """
+    if isinstance(e, requests.HTTPError) and e.response is not None:
+        return f"HTTP {e.response.status_code} {e.response.reason}"
+    if isinstance(e, requests.Timeout):
+        return "Timeout"
+    if isinstance(e, requests.ConnectionError):
+        return "ConnectionError"
+    # その他は例外クラス名のみ（メッセージは含めない）
+    return type(e).__name__
+
 
 def load_state(gist_token: str, gist_id: str) -> dict:
     res = requests.get(
@@ -32,8 +51,14 @@ def load_state(gist_token: str, gist_id: str) -> dict:
         timeout=10,
     )
     res.raise_for_status()
-    content = res.json()["files"]["state.json"]["content"]
-    return json.loads(content)
+    files = res.json().get("files", {})
+    state_file = files.get("state.json")
+    if not state_file or not state_file.get("content"):
+        return {"last_comment_ids": {}}
+    try:
+        return json.loads(state_file["content"])
+    except json.JSONDecodeError:
+        return {"last_comment_ids": {}}
 
 
 def save_state(gist_token: str, gist_id: str, state: dict) -> None:
@@ -45,30 +70,72 @@ def save_state(gist_token: str, gist_id: str, state: dict) -> None:
     ).raise_for_status()
 
 
-def fetch_comments(post_id: int, since_id: int) -> list[dict]:
+def fetch_comments(post_id: int) -> list[dict]:
+    """指定postの最新50件のコメントを取得（フィルタなし）。"""
     url = f"{WP_BASE}/comments?post={post_id}&per_page=50&orderby=date&order=desc"
     res = requests.get(url, headers=HEADERS, timeout=10)
     res.raise_for_status()
-    comments = res.json()
-    return [c for c in comments if c["id"] > since_id]
+    return res.json()
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._chunks: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs):  # noqa: ANN001
+        if tag in ("script", "style"):
+            self._skip_depth += 1
+        elif tag == "br":
+            self._chunks.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style") and self._skip_depth > 0:
+            self._skip_depth -= 1
+        elif tag in ("p", "div", "li"):
+            self._chunks.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            self._chunks.append(data)
+
+    def get_text(self) -> str:
+        return "".join(self._chunks).strip()
 
 
 def strip_html(html: str) -> str:
-    text = re.sub(r"<[^>]+>", "", html)
-    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#039;", "'")
-    return text.strip()
+    parser = _TextExtractor()
+    parser.feed(html)
+    parser.close()
+    return parser.get_text()
+
+
+class _ImageExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.urls: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:  # noqa: ANN001
+        if tag != "img":
+            return
+        for k, v in attrs:
+            if k == "src" and v and v.startswith("https://"):
+                self.urls.append(v)
+                break
 
 
 def extract_images(html: str) -> list[str]:
-    return re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', html)
+    """img タグから https:// プレフィックスのみのURLを抽出（SSRF対策）。"""
+    parser = _ImageExtractor()
+    parser.feed(html)
+    parser.close()
+    return parser.urls
 
 
 def format_time(date_str: str) -> str:
     dt = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc).astimezone(JST)
     return dt.strftime("%-m/%-d %H:%M")
-
-
-TEXT_LIMIT = 1000
 
 
 def build_flex_bubble(page: dict, comment: dict) -> dict:
@@ -172,12 +239,12 @@ def main() -> None:
         since_id = last_ids.get(str(post_id), 0)
 
         try:
-            all_comments = fetch_comments(post_id, since_id=0)
-            new_comments = [c for c in all_comments if c["id"] > since_id]
+            all_comments = fetch_comments(post_id)
         except Exception as e:
-            print(f"[{page['name']}] fetch error: {e}", file=sys.stderr)
+            print(f"[{page['name']}] fetch error: {safe_error_str(e)}", file=sys.stderr)
             continue
 
+        new_comments = [c for c in all_comments if c["id"] > since_id]
         if not new_comments:
             continue
 
@@ -189,7 +256,7 @@ def main() -> None:
                 last_ids[str(post_id)] = c["id"]
                 state_updated = True
             except Exception as e:
-                print(f"[{page['name']}] LINE send error (comment {c['id']}): {e}", file=sys.stderr)
+                print(f"[{page['name']}] LINE send error (comment {c['id']}): {safe_error_str(e)}", file=sys.stderr)
                 break  # 失敗したらこのページは中断（次回再試行できるよう状態保存）
 
         if notified:
