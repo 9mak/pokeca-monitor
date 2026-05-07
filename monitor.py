@@ -23,7 +23,7 @@ PAGES = [
 WP_BASE = "https://gamenv.net/tc/wp-json/wp/v2"
 PAGE_BASE = "https://gamenv.net/tc"
 
-LINE_API = "https://api.line.me/v2/bot/message/push"
+LINE_API = "https://api.line.me/v2/bot/message/broadcast"
 
 TEXT_LIMIT = 1000
 
@@ -188,20 +188,20 @@ def build_flex_bubble(page: dict, comment: dict) -> dict:
     }
 
 
-def send_line_messages(token: str, user_id: str, messages: list[dict]) -> None:
-    """1〜5件のmessageオブジェクトをまとめて1リクエストで送る"""
+def send_line_messages(token: str, messages: list[dict]) -> None:
+    """1〜5件のmessageオブジェクトを Bot 友達全員にブロードキャスト送信"""
     requests.post(
         LINE_API,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
-        json={"to": user_id, "messages": messages},
+        json={"messages": messages},
         timeout=10,
     ).raise_for_status()
 
 
-def notify_comment(token: str, user_id: str, page: dict, comment: dict) -> None:
+def notify_comment(token: str, page: dict, comment: dict) -> None:
     """1コメント = 1通知（Flex Message + 画像最大4枚を1リクエストにまとめる）"""
     bubble = build_flex_bubble(page, comment)
     is_reply = comment.get("parent", 0) > 0
@@ -220,12 +220,11 @@ def notify_comment(token: str, user_id: str, page: dict, comment: dict) -> None:
             "originalContentUrl": img_url,
             "previewImageUrl": img_url,
         })
-    send_line_messages(token, user_id, messages)
+    send_line_messages(token, messages)
 
 
 def main() -> None:
     line_token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-    line_user_id = os.environ["LINE_USER_ID"]
     gist_token = os.environ["GIST_TOKEN"]
     gist_id = os.environ["GIST_ID"]
 
@@ -251,7 +250,7 @@ def main() -> None:
         notified = 0
         for c in sorted(new_comments, key=lambda x: x["id"]):
             try:
-                notify_comment(line_token, line_user_id, page, c)
+                notify_comment(line_token, page, c)
                 notified += 1
                 last_ids[str(post_id)] = c["id"]
                 state_updated = True
