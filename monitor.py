@@ -143,7 +143,7 @@ def build_flex_bubble(page: dict, comment: dict) -> dict:
     body = strip_html(html)
     if len(body) > TEXT_LIMIT:
         body = body[:TEXT_LIMIT] + "…"
-    time_str = format_time(comment["date"])
+    time_str = format_time(comment["date_gmt"])
     is_reply = comment.get("parent", 0) > 0
     header_label = f"↩ {page['name']}掲示板（返信）" if is_reply else f"💬 {page['name']}掲示板"
     link = comment.get("link") or f"{PAGE_BASE}/{page['slug']}/#comment-{comment['id']}"
