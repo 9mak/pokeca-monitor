@@ -23,9 +23,14 @@ PAGES = [
 WP_BASE = "https://gamenv.net/tc/wp-json/wp/v2"
 PAGE_BASE = "https://gamenv.net/tc"
 
-LINE_API = "https://api.line.me/v2/bot/message/broadcast"
+LINE_MULTICAST_API = "https://api.line.me/v2/bot/message/multicast"
+LINE_FOLLOWERS_API = "https://api.line.me/v2/bot/followers/ids"
 
 TEXT_LIMIT = 1000
+
+# 1ランで通知する件数の上限。短時間に新着が殺到した時の暴走を防ぐ。
+PER_PAGE_LIMIT = 15
+TOTAL_LIMIT_PER_RUN = 30
 
 
 def safe_error_str(e: Exception) -> str:
@@ -40,7 +45,6 @@ def safe_error_str(e: Exception) -> str:
         return "Timeout"
     if isinstance(e, requests.ConnectionError):
         return "ConnectionError"
-    # その他は例外クラス名のみ（メッセージは含めない）
     return type(e).__name__
 
 
@@ -188,20 +192,89 @@ def build_flex_bubble(page: dict, comment: dict) -> dict:
     }
 
 
-def send_line_messages(token: str, messages: list[dict]) -> None:
-    """1〜5件のmessageオブジェクトを Bot 友達全員にブロードキャスト送信"""
-    requests.post(
-        LINE_API,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
+def build_overflow_bubble(page: dict, count: int) -> dict:
+    """1ラン上限を超えて切り捨てたコメントを「他にN件」とまとめる Flex bubble。"""
+    header_text_color = page["header_text_color"]
+    sub_color = "#1B1B1BAA" if header_text_color == "#1B1B1B" else "#FFFFFFCC"
+    link = f"{PAGE_BASE}/{page['slug']}/"
+    return {
+        "type": "bubble",
+        "size": "kilo",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": page["color"],
+            "paddingAll": "12px",
+            "contents": [
+                {"type": "text", "text": f"⚠ {page['name']}掲示板（他に{count}件）", "color": header_text_color, "weight": "bold", "size": "md"},
+                {"type": "text", "text": "短時間に多くの更新", "color": sub_color, "size": "xs", "margin": "xs"},
+            ],
         },
-        json={"messages": messages},
-        timeout=10,
-    ).raise_for_status()
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "16px",
+            "contents": [
+                {"type": "text", "text": f"通知上限により{count}件の新着を省略しました。サイトでご確認ください。", "wrap": True, "size": "sm", "color": "#1B1B1B"},
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "12px",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "color": page["color"],
+                    "action": {"type": "uri", "label": "サイトで見る", "uri": link},
+                }
+            ],
+        },
+    }
 
 
-def notify_comment(token: str, page: dict, comment: dict) -> None:
+def fetch_follower_ids(token: str) -> list[str]:
+    """フォロワーのuserId一覧を取得。ページング対応。"""
+    user_ids: list[str] = []
+    next_token: str | None = None
+    while True:
+        params: dict[str, str] = {}
+        if next_token:
+            params["start"] = next_token
+        res = requests.get(
+            LINE_FOLLOWERS_API,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=10,
+        )
+        res.raise_for_status()
+        data = res.json()
+        user_ids.extend(data.get("userIds", []))
+        next_token = data.get("next")
+        if not next_token:
+            break
+    return user_ids
+
+
+def send_line_messages(token: str, messages: list[dict], user_ids: list[str]) -> None:
+    """multicastで送信。1リクエスト最大500ユーザーなので分割。"""
+    if not user_ids:
+        return
+    for i in range(0, len(user_ids), 500):
+        chunk = user_ids[i:i + 500]
+        requests.post(
+            LINE_MULTICAST_API,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={"to": chunk, "messages": messages},
+            timeout=10,
+        ).raise_for_status()
+
+
+def notify_comment(token: str, page: dict, comment: dict, user_ids: list[str]) -> None:
     """1コメント = 1通知（Flex Message + 画像最大4枚を1リクエストにまとめる）"""
     bubble = build_flex_bubble(page, comment)
     is_reply = comment.get("parent", 0) > 0
@@ -220,7 +293,18 @@ def notify_comment(token: str, page: dict, comment: dict) -> None:
             "originalContentUrl": img_url,
             "previewImageUrl": img_url,
         })
-    send_line_messages(token, messages)
+    send_line_messages(token, messages, user_ids)
+
+
+def notify_overflow(token: str, page: dict, count: int, user_ids: list[str]) -> None:
+    """切り捨てたコメント数を1通だけまとめて知らせる。"""
+    bubble = build_overflow_bubble(page, count)
+    messages: list[dict] = [{
+        "type": "flex",
+        "altText": f"⚠ {page['name']}掲示板に他に{count}件の更新",
+        "contents": bubble,
+    }]
+    send_line_messages(token, messages, user_ids)
 
 
 def main() -> None:
@@ -231,7 +315,17 @@ def main() -> None:
     state = load_state(gist_token, gist_id)
     last_ids: dict[str, int] = state.get("last_comment_ids", {})
 
+    try:
+        user_ids = fetch_follower_ids(line_token)
+    except Exception as e:
+        print(f"failed to fetch followers: {safe_error_str(e)}", file=sys.stderr)
+        sys.exit(1)
+    if not user_ids:
+        print("no followers, skip", file=sys.stderr)
+        return
+
     state_updated = False
+    total_sent = 0
 
     for page in PAGES:
         post_id = page["post_id"]
@@ -247,19 +341,46 @@ def main() -> None:
         if not new_comments:
             continue
 
+        ordered = sorted(new_comments, key=lambda x: x["id"])
+
+        # 全体上限到達後はそのページの新着を全部捨てて last_ids だけ最新に進める
+        global_remaining = TOTAL_LIMIT_PER_RUN - total_sent
+        if global_remaining <= 0:
+            last_ids[str(post_id)] = ordered[-1]["id"]
+            state_updated = True
+            print(f"[{page['name']}] global limit reached, dropped {len(ordered)}件", file=sys.stderr)
+            continue
+
+        send_count = min(len(ordered), PER_PAGE_LIMIT, global_remaining)
+        to_send = ordered[:send_count]
+        skipped = ordered[send_count:]
+
         notified = 0
-        for c in sorted(new_comments, key=lambda x: x["id"]):
+        for c in to_send:
             try:
-                notify_comment(line_token, page, c)
+                notify_comment(line_token, page, c, user_ids)
                 notified += 1
-                last_ids[str(post_id)] = c["id"]
-                state_updated = True
+                total_sent += 1
             except Exception as e:
                 print(f"[{page['name']}] LINE send error (comment {c['id']}): {safe_error_str(e)}", file=sys.stderr)
-                break  # 失敗したらこのページは中断（次回再試行できるよう状態保存）
+            # 成功・失敗いずれでも last_ids は進める（永久ループ防止）
+            last_ids[str(post_id)] = c["id"]
+            state_updated = True
+
+        if skipped:
+            try:
+                notify_overflow(line_token, page, len(skipped), user_ids)
+                total_sent += 1
+            except Exception as e:
+                print(f"[{page['name']}] overflow notify error: {safe_error_str(e)}", file=sys.stderr)
+            # overflow通知の成否に関わらず skipped 分は捨てる
+            last_ids[str(post_id)] = skipped[-1]["id"]
+            state_updated = True
 
         if notified:
             print(f"[{page['name']}] {notified}件通知 (max_id={last_ids[str(post_id)]})")
+        if skipped:
+            print(f"[{page['name']}] skipped {len(skipped)}件 (overflow通知のみ)")
 
     if state_updated:
         state["last_comment_ids"] = last_ids
