@@ -23,12 +23,12 @@ PAGES = [
 WP_BASE = "https://gamenv.net/tc/wp-json/wp/v2"
 PAGE_BASE = "https://gamenv.net/tc"
 
-LINE_MULTICAST_API = "https://api.line.me/v2/bot/message/multicast"
-LINE_FOLLOWERS_API = "https://api.line.me/v2/bot/followers/ids"
+LINE_BROADCAST_API = "https://api.line.me/v2/bot/message/broadcast"
 
 TEXT_LIMIT = 1000
 
-# 1ランで通知する件数の上限。短時間に新着が殺到した時の暴走を防ぐ。
+# 1ランで通知する件数の上限。短時間に新着が殺到した時の暴走と broadcast の
+# レート制限 (1時間60リクエスト) 超過を防ぐ。
 PER_PAGE_LIMIT = 15
 TOTAL_LIMIT_PER_RUN = 30
 
@@ -234,47 +234,20 @@ def build_overflow_bubble(page: dict, count: int) -> dict:
     }
 
 
-def fetch_follower_ids(token: str) -> list[str]:
-    """フォロワーのuserId一覧を取得。ページング対応。"""
-    user_ids: list[str] = []
-    next_token: str | None = None
-    while True:
-        params: dict[str, str] = {}
-        if next_token:
-            params["start"] = next_token
-        res = requests.get(
-            LINE_FOLLOWERS_API,
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-            timeout=10,
-        )
-        res.raise_for_status()
-        data = res.json()
-        user_ids.extend(data.get("userIds", []))
-        next_token = data.get("next")
-        if not next_token:
-            break
-    return user_ids
+def send_line_messages(token: str, messages: list[dict]) -> None:
+    """1〜5件のmessageオブジェクトを Bot 友達全員にブロードキャスト送信。"""
+    requests.post(
+        LINE_BROADCAST_API,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"messages": messages},
+        timeout=10,
+    ).raise_for_status()
 
 
-def send_line_messages(token: str, messages: list[dict], user_ids: list[str]) -> None:
-    """multicastで送信。1リクエスト最大500ユーザーなので分割。"""
-    if not user_ids:
-        return
-    for i in range(0, len(user_ids), 500):
-        chunk = user_ids[i:i + 500]
-        requests.post(
-            LINE_MULTICAST_API,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json={"to": chunk, "messages": messages},
-            timeout=10,
-        ).raise_for_status()
-
-
-def notify_comment(token: str, page: dict, comment: dict, user_ids: list[str]) -> None:
+def notify_comment(token: str, page: dict, comment: dict) -> None:
     """1コメント = 1通知（Flex Message + 画像最大4枚を1リクエストにまとめる）"""
     bubble = build_flex_bubble(page, comment)
     is_reply = comment.get("parent", 0) > 0
@@ -293,10 +266,10 @@ def notify_comment(token: str, page: dict, comment: dict, user_ids: list[str]) -
             "originalContentUrl": img_url,
             "previewImageUrl": img_url,
         })
-    send_line_messages(token, messages, user_ids)
+    send_line_messages(token, messages)
 
 
-def notify_overflow(token: str, page: dict, count: int, user_ids: list[str]) -> None:
+def notify_overflow(token: str, page: dict, count: int) -> None:
     """切り捨てたコメント数を1通だけまとめて知らせる。"""
     bubble = build_overflow_bubble(page, count)
     messages: list[dict] = [{
@@ -304,7 +277,7 @@ def notify_overflow(token: str, page: dict, count: int, user_ids: list[str]) -> 
         "altText": f"⚠ {page['name']}掲示板に他に{count}件の更新",
         "contents": bubble,
     }]
-    send_line_messages(token, messages, user_ids)
+    send_line_messages(token, messages)
 
 
 def main() -> None:
@@ -314,15 +287,6 @@ def main() -> None:
 
     state = load_state(gist_token, gist_id)
     last_ids: dict[str, int] = state.get("last_comment_ids", {})
-
-    try:
-        user_ids = fetch_follower_ids(line_token)
-    except Exception as e:
-        print(f"failed to fetch followers: {safe_error_str(e)}", file=sys.stderr)
-        sys.exit(1)
-    if not user_ids:
-        print("no followers, skip", file=sys.stderr)
-        return
 
     state_updated = False
     total_sent = 0
@@ -358,7 +322,7 @@ def main() -> None:
         notified = 0
         for c in to_send:
             try:
-                notify_comment(line_token, page, c, user_ids)
+                notify_comment(line_token, page, c)
                 notified += 1
                 total_sent += 1
             except Exception as e:
@@ -369,11 +333,10 @@ def main() -> None:
 
         if skipped:
             try:
-                notify_overflow(line_token, page, len(skipped), user_ids)
+                notify_overflow(line_token, page, len(skipped))
                 total_sent += 1
             except Exception as e:
                 print(f"[{page['name']}] overflow notify error: {safe_error_str(e)}", file=sys.stderr)
-            # overflow通知の成否に関わらず skipped 分は捨てる
             last_ids[str(post_id)] = skipped[-1]["id"]
             state_updated = True
 
