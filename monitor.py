@@ -280,6 +280,45 @@ def notify_overflow(token: str, page: dict, count: int) -> None:
     send_line_messages(token, messages)
 
 
+def build_error_bubble(errors: list[str]) -> dict:
+    body = "\n".join(f"・{e}" for e in errors)
+    if len(body) > TEXT_LIMIT:
+        body = body[:TEXT_LIMIT] + "…"
+    return {
+        "type": "bubble",
+        "size": "kilo",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#9CA3AF",
+            "paddingAll": "12px",
+            "contents": [
+                {"type": "text", "text": "⚠ pokeca-monitor エラー", "color": "#FFFFFF", "weight": "bold", "size": "md"},
+                {"type": "text", "text": f"{len(errors)}件発生", "color": "#FFFFFFCC", "size": "xs", "margin": "xs"},
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "16px",
+            "contents": [
+                {"type": "text", "text": body, "wrap": True, "size": "sm", "color": "#1B1B1B"},
+            ],
+        },
+    }
+
+
+def notify_error(token: str, errors: list[str]) -> None:
+    """ラン中のエラーを Flex 1通でまとめて知らせる。"""
+    bubble = build_error_bubble(errors)
+    messages: list[dict] = [{
+        "type": "flex",
+        "altText": f"⚠ pokeca-monitor: {len(errors)}件のエラー",
+        "contents": bubble,
+    }]
+    send_line_messages(token, messages)
+
+
 def main() -> None:
     line_token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
     gist_token = os.environ["GIST_TOKEN"]
@@ -290,6 +329,7 @@ def main() -> None:
 
     state_updated = False
     total_sent = 0
+    errors: list[str] = []
 
     for page in PAGES:
         post_id = page["post_id"]
@@ -298,7 +338,9 @@ def main() -> None:
         try:
             all_comments = fetch_comments(post_id)
         except Exception as e:
-            print(f"[{page['name']}] fetch error: {safe_error_str(e)}", file=sys.stderr)
+            msg = f"[{page['name']}] fetch error: {safe_error_str(e)}"
+            print(msg, file=sys.stderr)
+            errors.append(msg)
             continue
 
         new_comments = [c for c in all_comments if c["id"] > since_id]
@@ -326,7 +368,9 @@ def main() -> None:
                 notified += 1
                 total_sent += 1
             except Exception as e:
-                print(f"[{page['name']}] LINE send error (comment {c['id']}): {safe_error_str(e)}", file=sys.stderr)
+                msg = f"[{page['name']}] LINE send error (comment {c['id']}): {safe_error_str(e)}"
+                print(msg, file=sys.stderr)
+                errors.append(msg)
             # 成功・失敗いずれでも last_ids は進める（永久ループ防止）
             last_ids[str(post_id)] = c["id"]
             state_updated = True
@@ -336,7 +380,9 @@ def main() -> None:
                 notify_overflow(line_token, page, len(skipped))
                 total_sent += 1
             except Exception as e:
-                print(f"[{page['name']}] overflow notify error: {safe_error_str(e)}", file=sys.stderr)
+                msg = f"[{page['name']}] overflow notify error: {safe_error_str(e)}"
+                print(msg, file=sys.stderr)
+                errors.append(msg)
             last_ids[str(post_id)] = skipped[-1]["id"]
             state_updated = True
 
@@ -348,6 +394,12 @@ def main() -> None:
     if state_updated:
         state["last_comment_ids"] = last_ids
         save_state(gist_token, gist_id, state)
+
+    if errors:
+        try:
+            notify_error(line_token, errors)
+        except Exception as e:
+            print(f"error notify failed: {safe_error_str(e)}", file=sys.stderr)
 
 
 if __name__ == "__main__":
