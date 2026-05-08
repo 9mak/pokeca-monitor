@@ -1,44 +1,31 @@
 import json
 import os
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 
 import requests
 
-JST = timezone(timedelta(hours=9))
-
-# bot識別情報を含めつつ、サイト側で弾かれないUA
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; pokeca-monitor/1.0; +https://github.com/9mak/pokeca-monitor)"
 }
 
 PAGES = [
-    {"name": "ヨドバシ",     "post_id": 78763, "slug": "yodobashi", "color": "#E60012", "header_text_color": "#FFFFFF"},
-    {"name": "ビックカメラ", "post_id": 78776, "slug": "biccamera", "color": "#E50012", "header_text_color": "#FFFFFF"},
-    {"name": "ポケセン",     "post_id": 78787, "slug": "pokesen",   "color": "#FFCB05", "header_text_color": "#1B1B1B"},
-    {"name": "量販店",       "post_id": 50167, "slug": "stores",    "color": "#3B82F6", "header_text_color": "#FFFFFF"},
+    {"name": "ヨドバシ",     "post_id": 78763, "slug": "yodobashi", "color": "#E60012"},
+    {"name": "ビックカメラ", "post_id": 78776, "slug": "biccamera", "color": "#E50012"},
+    {"name": "ポケセン",     "post_id": 78787, "slug": "pokesen",   "color": "#FFCB05"},
+    {"name": "量販店",       "post_id": 50167, "slug": "stores",    "color": "#3B82F6"},
 ]
 
 WP_BASE = "https://gamenv.net/tc/wp-json/wp/v2"
 PAGE_BASE = "https://gamenv.net/tc"
 
-LINE_BROADCAST_API = "https://api.line.me/v2/bot/message/broadcast"
-
-TEXT_LIMIT = 1000
-
-# 1ランで通知する件数の上限。短時間に新着が殺到した時の暴走と broadcast の
-# レート制限 (1時間60リクエスト) 超過を防ぐ。
-PER_PAGE_LIMIT = 15
-TOTAL_LIMIT_PER_RUN = 30
+DESC_LIMIT = 4000
+TITLE_LIMIT = 256
+WEBHOOK_USERNAME = "pokeca-monitor"
 
 
 def safe_error_str(e: Exception) -> str:
-    """例外を安全な文字列に変換する。
-
-    requests.HTTPErrorのstr(e)はリクエストヘッダ（Authorization: Bearer ...）を
-    含む可能性があるため、HTTPステータスコードのみを抽出する。
-    """
     if isinstance(e, requests.HTTPError) and e.response is not None:
         return f"HTTP {e.response.status_code} {e.response.reason}"
     if isinstance(e, requests.Timeout):
@@ -75,7 +62,6 @@ def save_state(gist_token: str, gist_id: str, state: dict) -> None:
 
 
 def fetch_comments(post_id: int) -> list[dict]:
-    """指定postの最新50件のコメントを取得（フィルタなし）。"""
     url = f"{WP_BASE}/comments?post={post_id}&per_page=50&orderby=date&order=desc"
     res = requests.get(url, headers=HEADERS, timeout=10)
     res.raise_for_status()
@@ -137,190 +123,83 @@ def extract_images(html: str) -> list[str]:
     return parser.urls
 
 
-def format_time(date_str: str) -> str:
-    dt = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc).astimezone(JST)
-    return dt.strftime("%-m/%-d %H:%M")
+def hex_to_int(color: str) -> int:
+    return int(color.lstrip("#"), 16)
 
 
-def build_flex_bubble(page: dict, comment: dict) -> dict:
+def to_iso_utc(date_str: str) -> str:
+    return datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc).isoformat()
+
+
+def build_comment_embed(page: dict, comment: dict) -> dict:
     html = comment["content"]["rendered"]
     body = strip_html(html)
-    if len(body) > TEXT_LIMIT:
-        body = body[:TEXT_LIMIT] + "…"
-    time_str = format_time(comment["date_gmt"])
+    if len(body) > DESC_LIMIT:
+        body = body[:DESC_LIMIT] + "…"
     is_reply = comment.get("parent", 0) > 0
-    header_label = f"↩ {page['name']}掲示板（返信）" if is_reply else f"💬 {page['name']}掲示板"
+    title_prefix = "↩" if is_reply else "💬"
+    suffix = "（返信）" if is_reply else ""
+    title = f"{title_prefix} {page['name']}掲示板{suffix}"[:TITLE_LIMIT]
     link = comment.get("link") or f"{PAGE_BASE}/{page['slug']}/#comment-{comment['id']}"
 
-    header_text_color = page["header_text_color"]
-    sub_color = "#1B1B1BAA" if header_text_color == "#1B1B1B" else "#FFFFFFCC"
+    embed: dict = {
+        "title": title,
+        "description": body or "（本文なし）",
+        "url": link,
+        "color": hex_to_int(page["color"]),
+        "timestamp": to_iso_utc(comment["date_gmt"]),
+    }
+    images = extract_images(html)
+    if images:
+        embed["image"] = {"url": images[0]}
+        if len(images) > 1:
+            embed["footer"] = {"text": f"画像 他{len(images) - 1}枚はサイトで確認"}
+    return embed
 
+
+def build_error_embed(errors: list[str]) -> dict:
+    body = "\n".join(f"• {e}" for e in errors)
+    if len(body) > DESC_LIMIT:
+        body = body[:DESC_LIMIT] + "…"
     return {
-        "type": "bubble",
-        "size": "kilo",
-        "header": {
-            "type": "box",
-            "layout": "vertical",
-            "backgroundColor": page["color"],
-            "paddingAll": "12px",
-            "contents": [
-                {"type": "text", "text": header_label, "color": header_text_color, "weight": "bold", "size": "md"},
-                {"type": "text", "text": time_str, "color": sub_color, "size": "xs", "margin": "xs"},
-            ],
-        },
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "paddingAll": "16px",
-            "contents": [
-                {"type": "text", "text": body or "（本文なし）", "wrap": True, "size": "md", "color": "#1B1B1B"},
-            ],
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "paddingAll": "12px",
-            "contents": [
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "color": page["color"],
-                    "action": {"type": "uri", "label": "サイトで見る", "uri": link},
-                }
-            ],
-        },
+        "title": f"⚠ pokeca-monitor エラー ({len(errors)}件)",
+        "description": body,
+        "color": hex_to_int("#9CA3AF"),
     }
 
 
-def build_overflow_bubble(page: dict, count: int) -> dict:
-    """1ラン上限を超えて切り捨てたコメントを「他にN件」とまとめる Flex bubble。"""
-    header_text_color = page["header_text_color"]
-    sub_color = "#1B1B1BAA" if header_text_color == "#1B1B1B" else "#FFFFFFCC"
-    link = f"{PAGE_BASE}/{page['slug']}/"
+def link_button_row(label: str, url: str) -> dict:
     return {
-        "type": "bubble",
-        "size": "kilo",
-        "header": {
-            "type": "box",
-            "layout": "vertical",
-            "backgroundColor": page["color"],
-            "paddingAll": "12px",
-            "contents": [
-                {"type": "text", "text": f"⚠ {page['name']}掲示板（他に{count}件）", "color": header_text_color, "weight": "bold", "size": "md"},
-                {"type": "text", "text": "短時間に多くの更新", "color": sub_color, "size": "xs", "margin": "xs"},
-            ],
-        },
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "paddingAll": "16px",
-            "contents": [
-                {"type": "text", "text": f"通知上限により{count}件の新着を省略しました。サイトでご確認ください。", "wrap": True, "size": "sm", "color": "#1B1B1B"},
-            ],
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "paddingAll": "12px",
-            "contents": [
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "color": page["color"],
-                    "action": {"type": "uri", "label": "サイトで見る", "uri": link},
-                }
-            ],
-        },
+        "type": 1,
+        "components": [
+            {"type": 2, "style": 5, "label": label, "url": url},
+        ],
     }
 
 
-def send_line_messages(token: str, messages: list[dict]) -> None:
-    """1〜5件のmessageオブジェクトを Bot 友達全員にブロードキャスト送信。"""
+def send_webhook(webhook_url: str, embeds: list[dict], components: list[dict] | None = None) -> None:
+    """1〜10個の embed と任意のリンクボタン群を1リクエストで送信。"""
+    payload: dict = {"username": WEBHOOK_USERNAME, "embeds": embeds}
+    if components:
+        payload["components"] = components
     requests.post(
-        LINE_BROADCAST_API,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={"messages": messages},
+        webhook_url + "?with_components=true",
+        json=payload,
         timeout=10,
     ).raise_for_status()
 
 
-def notify_comment(token: str, page: dict, comment: dict) -> None:
-    """1コメント = 1通知（Flex Message + 画像最大4枚を1リクエストにまとめる）"""
-    bubble = build_flex_bubble(page, comment)
-    is_reply = comment.get("parent", 0) > 0
-    alt_prefix = "↩" if is_reply else "💬"
-    alt_text = f"{alt_prefix} {page['name']}掲示板に新着コメント"
-
-    messages: list[dict] = [{
-        "type": "flex",
-        "altText": alt_text,
-        "contents": bubble,
-    }]
-    images = extract_images(comment["content"]["rendered"])
-    for img_url in images[:4]:  # LINEは1リクエスト最大5メッセージ
-        messages.append({
-            "type": "image",
-            "originalContentUrl": img_url,
-            "previewImageUrl": img_url,
-        })
-    send_line_messages(token, messages)
+def notify_comment(webhook_url: str, page: dict, comment: dict) -> None:
+    embed = build_comment_embed(page, comment)
+    send_webhook(webhook_url, [embed], [link_button_row("サイトで見る", embed["url"])])
 
 
-def notify_overflow(token: str, page: dict, count: int) -> None:
-    """切り捨てたコメント数を1通だけまとめて知らせる。"""
-    bubble = build_overflow_bubble(page, count)
-    messages: list[dict] = [{
-        "type": "flex",
-        "altText": f"⚠ {page['name']}掲示板に他に{count}件の更新",
-        "contents": bubble,
-    }]
-    send_line_messages(token, messages)
-
-
-def build_error_bubble(errors: list[str]) -> dict:
-    body = "\n".join(f"・{e}" for e in errors)
-    if len(body) > TEXT_LIMIT:
-        body = body[:TEXT_LIMIT] + "…"
-    return {
-        "type": "bubble",
-        "size": "kilo",
-        "header": {
-            "type": "box",
-            "layout": "vertical",
-            "backgroundColor": "#9CA3AF",
-            "paddingAll": "12px",
-            "contents": [
-                {"type": "text", "text": "⚠ pokeca-monitor エラー", "color": "#FFFFFF", "weight": "bold", "size": "md"},
-                {"type": "text", "text": f"{len(errors)}件発生", "color": "#FFFFFFCC", "size": "xs", "margin": "xs"},
-            ],
-        },
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "paddingAll": "16px",
-            "contents": [
-                {"type": "text", "text": body, "wrap": True, "size": "sm", "color": "#1B1B1B"},
-            ],
-        },
-    }
-
-
-def notify_error(token: str, errors: list[str]) -> None:
-    """ラン中のエラーを Flex 1通でまとめて知らせる。"""
-    bubble = build_error_bubble(errors)
-    messages: list[dict] = [{
-        "type": "flex",
-        "altText": f"⚠ pokeca-monitor: {len(errors)}件のエラー",
-        "contents": bubble,
-    }]
-    send_line_messages(token, messages)
+def notify_error(webhook_url: str, errors: list[str]) -> None:
+    send_webhook(webhook_url, [build_error_embed(errors)])
 
 
 def main() -> None:
-    line_token = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
+    webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
     gist_token = os.environ["GIST_TOKEN"]
     gist_id = os.environ["GIST_ID"]
 
@@ -328,7 +207,6 @@ def main() -> None:
     last_ids: dict[str, int] = state.get("last_comment_ids", {})
 
     state_updated = False
-    total_sent = 0
     errors: list[str] = []
 
     for page in PAGES:
@@ -349,47 +227,20 @@ def main() -> None:
 
         ordered = sorted(new_comments, key=lambda x: x["id"])
 
-        # 全体上限到達後はそのページの新着を全部捨てて last_ids だけ最新に進める
-        global_remaining = TOTAL_LIMIT_PER_RUN - total_sent
-        if global_remaining <= 0:
-            last_ids[str(post_id)] = ordered[-1]["id"]
-            state_updated = True
-            print(f"[{page['name']}] global limit reached, dropped {len(ordered)}件", file=sys.stderr)
-            continue
-
-        send_count = min(len(ordered), PER_PAGE_LIMIT, global_remaining)
-        to_send = ordered[:send_count]
-        skipped = ordered[send_count:]
-
         notified = 0
-        for c in to_send:
+        for c in ordered:
             try:
-                notify_comment(line_token, page, c)
+                notify_comment(webhook_url, page, c)
                 notified += 1
-                total_sent += 1
             except Exception as e:
-                msg = f"[{page['name']}] LINE send error (comment {c['id']}): {safe_error_str(e)}"
+                msg = f"[{page['name']}] webhook send error (comment {c['id']}): {safe_error_str(e)}"
                 print(msg, file=sys.stderr)
                 errors.append(msg)
-            # 成功・失敗いずれでも last_ids は進める（永久ループ防止）
             last_ids[str(post_id)] = c["id"]
-            state_updated = True
-
-        if skipped:
-            try:
-                notify_overflow(line_token, page, len(skipped))
-                total_sent += 1
-            except Exception as e:
-                msg = f"[{page['name']}] overflow notify error: {safe_error_str(e)}"
-                print(msg, file=sys.stderr)
-                errors.append(msg)
-            last_ids[str(post_id)] = skipped[-1]["id"]
             state_updated = True
 
         if notified:
             print(f"[{page['name']}] {notified}件通知 (max_id={last_ids[str(post_id)]})")
-        if skipped:
-            print(f"[{page['name']}] skipped {len(skipped)}件 (overflow通知のみ)")
 
     if state_updated:
         state["last_comment_ids"] = last_ids
@@ -397,7 +248,7 @@ def main() -> None:
 
     if errors:
         try:
-            notify_error(line_token, errors)
+            notify_error(webhook_url, errors)
         except Exception as e:
             print(f"error notify failed: {safe_error_str(e)}", file=sys.stderr)
 
