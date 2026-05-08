@@ -173,24 +173,12 @@ def build_error_embed(errors: list[str]) -> dict:
     }
 
 
-def link_button_row(label: str, url: str) -> dict:
-    return {
-        "type": 1,
-        "components": [
-            {"type": 2, "style": 5, "label": label, "url": url},
-        ],
-    }
-
-
-def send_webhook(webhook_url: str, embeds: list[dict], components: list[dict] | None = None) -> None:
-    """1〜10個の embed と任意のリンクボタン群を1リクエストで送信。429 は Retry-After に従って再送。"""
-    payload: dict = {"username": WEBHOOK_USERNAME, "embeds": embeds}
-    if components:
-        payload["components"] = components
-    url = webhook_url + "?with_components=true"
+def send_webhook(webhook_url: str, embeds: list[dict]) -> None:
+    """1〜10個の embed を1リクエストで送信。429 は Retry-After に従って再送。"""
+    payload = {"username": WEBHOOK_USERNAME, "embeds": embeds}
 
     for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
-        res = requests.post(url, json=payload, timeout=10)
+        res = requests.post(webhook_url, json=payload, timeout=10)
         if res.status_code != 429:
             res.raise_for_status()
             return
@@ -202,8 +190,7 @@ def send_webhook(webhook_url: str, embeds: list[dict], components: list[dict] | 
 
 
 def notify_comment(webhook_url: str, page: dict, comment: dict) -> None:
-    embed = build_comment_embed(page, comment)
-    send_webhook(webhook_url, [embed], [link_button_row("サイトで見る", embed["url"])])
+    send_webhook(webhook_url, [build_comment_embed(page, comment)])
 
 
 def notify_error(webhook_url: str, errors: list[str]) -> None:
