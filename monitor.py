@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 
@@ -23,6 +24,10 @@ PAGE_BASE = "https://gamenv.net/tc"
 DESC_LIMIT = 4000
 TITLE_LIMIT = 256
 WEBHOOK_USERNAME = "pokeca-monitor"
+
+# Discord webhook の rate limit (チャンネル5req/sec, webhook 30req/min) 用
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_RETRY_CAP_SEC = 30
 
 
 def safe_error_str(e: Exception) -> str:
@@ -178,15 +183,22 @@ def link_button_row(label: str, url: str) -> dict:
 
 
 def send_webhook(webhook_url: str, embeds: list[dict], components: list[dict] | None = None) -> None:
-    """1〜10個の embed と任意のリンクボタン群を1リクエストで送信。"""
+    """1〜10個の embed と任意のリンクボタン群を1リクエストで送信。429 は Retry-After に従って再送。"""
     payload: dict = {"username": WEBHOOK_USERNAME, "embeds": embeds}
     if components:
         payload["components"] = components
-    requests.post(
-        webhook_url + "?with_components=true",
-        json=payload,
-        timeout=10,
-    ).raise_for_status()
+    url = webhook_url + "?with_components=true"
+
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        res = requests.post(url, json=payload, timeout=10)
+        if res.status_code != 429:
+            res.raise_for_status()
+            return
+        if attempt == RATE_LIMIT_MAX_RETRIES:
+            res.raise_for_status()
+            return
+        retry_after = float(res.headers.get("Retry-After", "1"))
+        time.sleep(min(retry_after, RATE_LIMIT_RETRY_CAP_SEC))
 
 
 def notify_comment(webhook_url: str, page: dict, comment: dict) -> None:
