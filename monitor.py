@@ -25,6 +25,9 @@ DESC_LIMIT = 4000
 TITLE_LIMIT = 256
 WEBHOOK_USERNAME = "pokeca-monitor"
 
+# Discord webhook は 1リクエストあたり最大10 embed
+EMBEDS_PER_REQUEST = 10
+
 # Discord webhook の rate limit (チャンネル5req/sec, webhook 30req/min) 用
 RATE_LIMIT_MAX_RETRIES = 3
 RATE_LIMIT_RETRY_CAP_SEC = 30
@@ -189,10 +192,6 @@ def send_webhook(webhook_url: str, embeds: list[dict]) -> None:
         time.sleep(min(retry_after, RATE_LIMIT_RETRY_CAP_SEC))
 
 
-def notify_comment(webhook_url: str, page: dict, comment: dict) -> None:
-    send_webhook(webhook_url, [build_comment_embed(page, comment)])
-
-
 def notify_error(webhook_url: str, errors: list[str]) -> None:
     send_webhook(webhook_url, [build_error_embed(errors)])
 
@@ -205,7 +204,6 @@ def main() -> None:
     state = load_state(gist_token, gist_id)
     last_ids: dict[str, int] = state.get("last_comment_ids", {})
 
-    state_updated = False
     errors: list[str] = []
 
     for page in PAGES:
@@ -227,23 +225,32 @@ def main() -> None:
         ordered = sorted(new_comments, key=lambda x: x["id"])
 
         notified = 0
-        for c in ordered:
+        page_updated = False
+        for i in range(0, len(ordered), EMBEDS_PER_REQUEST):
+            chunk = ordered[i : i + EMBEDS_PER_REQUEST]
+            embeds = [build_comment_embed(page, c) for c in chunk]
             try:
-                notify_comment(webhook_url, page, c)
-                notified += 1
+                send_webhook(webhook_url, embeds)
+                notified += len(chunk)
             except Exception as e:
-                msg = f"[{page['name']}] webhook send error (comment {c['id']}): {safe_error_str(e)}"
+                msg = f"[{page['name']}] webhook send error (comments {chunk[0]['id']}-{chunk[-1]['id']}): {safe_error_str(e)}"
                 print(msg, file=sys.stderr)
                 errors.append(msg)
-            last_ids[str(post_id)] = c["id"]
-            state_updated = True
+            last_ids[str(post_id)] = chunk[-1]["id"]
+            page_updated = True
 
         if notified:
             print(f"[{page['name']}] {notified}件通知 (max_id={last_ids[str(post_id)]})")
 
-    if state_updated:
-        state["last_comment_ids"] = last_ids
-        save_state(gist_token, gist_id, state)
+        # ページ完了ごとに state を保存（中断されても進捗を失わない）
+        if page_updated:
+            state["last_comment_ids"] = last_ids
+            try:
+                save_state(gist_token, gist_id, state)
+            except Exception as e:
+                msg = f"state save error after [{page['name']}]: {safe_error_str(e)}"
+                print(msg, file=sys.stderr)
+                errors.append(msg)
 
     if errors:
         try:
