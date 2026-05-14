@@ -25,8 +25,9 @@ DESC_LIMIT = 4000
 TITLE_LIMIT = 256
 WEBHOOK_USERNAME = "pokeca-monitor"
 
-# Discord webhook は 1リクエストあたり最大10 embed
-EMBEDS_PER_REQUEST = 10
+# 1ページの新着がこの件数を超えたらダイジェスト1通にまとめる
+# Discord webhook は 1リクエストあたり最大10 embed なので、しきい値も10
+DIGEST_THRESHOLD = 10
 
 # Discord webhook の rate limit (チャンネル5req/sec, webhook 30req/min) 用
 RATE_LIMIT_MAX_RETRIES = 3
@@ -165,6 +166,19 @@ def build_comment_embed(page: dict, comment: dict) -> dict:
     return embed
 
 
+def build_digest_embed(page: dict, comments: list[dict]) -> dict:
+    """大量バックログ用: 個別embedをやめて件数だけ通知し、サイトに誘導。"""
+    latest = comments[-1]
+    page_url = f"{PAGE_BASE}/{page['slug']}/"
+    return {
+        "title": f"📬 {page['name']}掲示板に新着 {len(comments)} 件",
+        "description": "バックログがたまっています。サイトでまとめて確認してください。",
+        "url": page_url,
+        "color": hex_to_int(page["color"]),
+        "timestamp": to_iso_utc(latest["date_gmt"]),
+    }
+
+
 def build_error_embed(errors: list[str]) -> dict:
     body = "\n".join(f"• {e}" for e in errors)
     if len(body) > DESC_LIMIT:
@@ -224,23 +238,23 @@ def main() -> None:
 
         ordered = sorted(new_comments, key=lambda x: x["id"])
 
-        notified = 0
-        page_updated = False
-        for i in range(0, len(ordered), EMBEDS_PER_REQUEST):
-            chunk = ordered[i : i + EMBEDS_PER_REQUEST]
-            embeds = [build_comment_embed(page, c) for c in chunk]
-            try:
-                send_webhook(webhook_url, embeds)
-                notified += len(chunk)
-            except Exception as e:
-                msg = f"[{page['name']}] webhook send error (comments {chunk[0]['id']}-{chunk[-1]['id']}): {safe_error_str(e)}"
-                print(msg, file=sys.stderr)
-                errors.append(msg)
-            last_ids[str(post_id)] = chunk[-1]["id"]
-            page_updated = True
+        if len(ordered) > DIGEST_THRESHOLD:
+            embeds = [build_digest_embed(page, ordered)]
+            label = f"{len(ordered)}件をダイジェストで通知"
+        else:
+            embeds = [build_comment_embed(page, c) for c in ordered]
+            label = f"{len(ordered)}件通知"
 
-        if notified:
-            print(f"[{page['name']}] {notified}件通知 (max_id={last_ids[str(post_id)]})")
+        try:
+            send_webhook(webhook_url, embeds)
+            print(f"[{page['name']}] {label} (max_id={ordered[-1]['id']})")
+        except Exception as e:
+            msg = f"[{page['name']}] webhook send error (comments {ordered[0]['id']}-{ordered[-1]['id']}): {safe_error_str(e)}"
+            print(msg, file=sys.stderr)
+            errors.append(msg)
+
+        last_ids[str(post_id)] = ordered[-1]["id"]
+        page_updated = True
 
         # ページ完了ごとに state を保存（中断されても進捗を失わない）
         if page_updated:
